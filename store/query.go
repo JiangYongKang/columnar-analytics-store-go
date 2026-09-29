@@ -52,6 +52,14 @@ type Result struct {
 	Values []Value
 }
 
+// QueryOptions 查询执行的附加预算。
+type QueryOptions struct {
+	// FragmentBytesBudget 读取片段数据的字节预算（按实际读取的文件大小计费，
+	// 被区段裁剪跳过的片段不占用预算）。0 表示不限。
+	// 超限时返回 RESOURCE_EXHAUSTED 且不产出结果。
+	FragmentBytesBudget int64
+}
+
 // MemLimiter 限制查询内存占用；超出时返回
 // ErrCodeResourceExhausted，保证内存随命中范围有界。
 type MemLimiter struct {
@@ -102,8 +110,16 @@ type aggState struct {
 // Execute 在快照上执行查询。逐片段、逐列流式处理，
 // 内存占用与命中数据相关而非整表规模。
 // 片段损坏 / 上下文取消 / 内存不足分别返回可区分错误。
-func Execute(ctx context.Context, sn *Snapshot, q *Query, lim *MemLimiter) (*Result, error) {
+func Execute(ctx context.Context, sn *Snapshot, q *Query, lim *MemLimiter, opts ...QueryOptions) (*Result, error) {
 	schema := sn.Schema()
+	var qopt QueryOptions
+	if len(opts) > 0 {
+		qopt = opts[0]
+	}
+	var fragLim *MemLimiter
+	if qopt.FragmentBytesBudget > 0 {
+		fragLim = &MemLimiter{BudgetBytes: qopt.FragmentBytesBudget}
+	}
 
 	// 解析谓词与聚合所需的字段 ID（按快照结构的名字解析，
 	// 重命名后按新名命中同一列，语义稳定）。
@@ -130,20 +146,37 @@ func Execute(ctx context.Context, sn *Snapshot, q *Query, lim *MemLimiter) (*Res
 		aggs[i] = st
 	}
 
+	var fragHeld int64 // 已扫描片段累计占用，查询结束统一释放
 	for _, meta := range sn.Fragments() {
 		if err := ctx.Err(); err != nil {
+			fragLim.Release(fragHeld)
 			return nil, &Error{Code: ErrCodeInterrupted, Op: "execute", Err: err}
 		}
+		// 区段裁剪：缺列/全 NULL/区段不相交的片段不可能命中，直接跳过
+		// （不读文件、不计预算），结果与完整扫描完全一致。
+		if !fragmentCanMatch(meta, preds) {
+			continue
+		}
+		// 片段级预算：按文件大小累计计费，查询结束才释放；被裁剪的片段
+		// 不计费，因此预算只与实际扫描的数据相关，不随整表历史规模膨胀。
+		fragCost := fragmentBudgetCost(meta)
+		if err := fragLim.Acquire(fragCost); err != nil {
+			fragLim.Release(fragHeld)
+			return nil, err
+		}
+		fragHeld += fragCost
 		frag, err := sn.store.loadFragment(sn.table, meta)
 		if err != nil {
+			fragLim.Release(fragHeld)
 			return nil, err // 已归一化：CORRUPT_FRAGMENT / INTERRUPTED
 		}
 
-		// 逐行评估谓词；命中行才计入内存配额与聚合状态。
+		// 逐行评估谓词；命中行才计入行级内存配额与聚合状态。
 		n := frag.NumRows
 		for row := 0; row < n; row++ {
 			if row%1024 == 0 {
 				if err := ctx.Err(); err != nil {
+					fragLim.Release(fragHeld)
 					return nil, &Error{Code: ErrCodeInterrupted, Op: "execute", Err: err}
 				}
 			}
@@ -151,6 +184,7 @@ func Execute(ctx context.Context, sn *Snapshot, q *Query, lim *MemLimiter) (*Res
 				continue
 			}
 			if err := lim.Acquire(perRowBytes); err != nil {
+				fragLim.Release(fragHeld)
 				return nil, err
 			}
 			for _, st := range aggs {
@@ -158,6 +192,7 @@ func Execute(ctx context.Context, sn *Snapshot, q *Query, lim *MemLimiter) (*Res
 			}
 		}
 	}
+	fragLim.Release(fragHeld)
 
 	res := &Result{Values: make([]Value, len(aggs))}
 	for i, st := range aggs {

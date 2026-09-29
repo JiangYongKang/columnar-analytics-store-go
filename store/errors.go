@@ -20,6 +20,16 @@ const (
 	ErrCodeInterrupted ErrCode = "INTERRUPTED"
 	// ErrCodeNotFound 表或快照不存在。
 	ErrCodeNotFound ErrCode = "NOT_FOUND"
+	// ErrCodeVersionUnavailable 请求的历史版本超出保留窗口或尚未提交。
+	ErrCodeVersionUnavailable ErrCode = "VERSION_UNAVAILABLE"
+)
+
+// VersionUnavailable 的细分原因。
+const (
+	// ReasonVersionTrimmed 版本曾存在但已超出保留窗口被裁剪。
+	ReasonVersionTrimmed = "VERSION_TRIMMED"
+	// ReasonVersionNotCommitted 请求版本晚于当前最新版本（尚未提交）。
+	ReasonVersionNotCommitted = "VERSION_NOT_COMMITTED"
 )
 
 // ConflictReason 写冲突的细分原因。

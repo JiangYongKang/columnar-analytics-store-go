@@ -30,6 +30,11 @@ type FragmentMeta struct {
 	SchemaV int
 	NumRows int
 	File    string // 磁盘文件名
+	// Size 片段文件字节数，用于自动整理体积阈值与查询内存预算。
+	Size int64 `json:"size"`
+	// Stats 按字段 ID 记录的区段统计（仅当前结构可见列；
+	// 片段缺列不会出现，结构删除列不记录）。
+	Stats map[int]ColumnStat `json:"stats,omitempty"`
 }
 
 var fragmentMagic = []byte("CFR1")
