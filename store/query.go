@@ -103,6 +103,18 @@ type aggState struct {
 // 内存占用与命中数据相关而非整表规模。
 // 片段损坏 / 上下文取消 / 内存不足分别返回可区分错误。
 func Execute(ctx context.Context, sn *Snapshot, q *Query, lim *MemLimiter) (*Result, error) {
+	res, _, err := execute(ctx, sn, q, lim)
+	return res, err
+}
+
+// ExecuteStats 与 Execute 结果完全一致，额外返回裁剪统计
+// （总片段数 / 被跳过片段数 / 实际扫描片段数 / 命中行数）。
+func ExecuteStats(ctx context.Context, sn *Snapshot, q *Query, lim *MemLimiter) (*Result, *QueryStats, error) {
+	return execute(ctx, sn, q, lim)
+}
+
+func execute(ctx context.Context, sn *Snapshot, q *Query, lim *MemLimiter) (*Result, *QueryStats, error) {
+	stats := &QueryStats{}
 	schema := sn.Schema()
 
 	// 解析谓词与聚合所需的字段 ID（按快照结构的名字解析，
@@ -111,7 +123,7 @@ func Execute(ctx context.Context, sn *Snapshot, q *Query, lim *MemLimiter) (*Res
 	for _, p := range q.Predicates {
 		f := schema.FieldByName(p.Field)
 		if f == nil {
-			return nil, &Error{Code: ErrCodeSchemaIncompatible, Op: "bind-predicate",
+			return nil, nil, &Error{Code: ErrCodeSchemaIncompatible, Op: "bind-predicate",
 				Reason: "NO_SUCH_FIELD:" + p.Field, Err: fmt.Errorf("predicate field not in snapshot schema")}
 		}
 		preds = append(preds, boundPred{fieldID: f.ID, op: p.Op, val: p.Value})
@@ -122,7 +134,7 @@ func Execute(ctx context.Context, sn *Snapshot, q *Query, lim *MemLimiter) (*Res
 		if a.Kind != AggCount || a.Field != "" {
 			f := schema.FieldByName(a.Field)
 			if f == nil {
-				return nil, &Error{Code: ErrCodeSchemaIncompatible, Op: "bind-aggregate",
+				return nil, nil, &Error{Code: ErrCodeSchemaIncompatible, Op: "bind-aggregate",
 					Reason: "NO_SUCH_FIELD:" + a.Field, Err: fmt.Errorf("aggregate field not in snapshot schema")}
 			}
 			st.fieldID = f.ID
@@ -130,29 +142,48 @@ func Execute(ctx context.Context, sn *Snapshot, q *Query, lim *MemLimiter) (*Res
 		aggs[i] = st
 	}
 
-	for _, meta := range sn.Fragments() {
+	metas := sn.Fragments()
+	stats.FragmentsTotal = len(metas)
+	for _, meta := range metas {
 		if err := ctx.Err(); err != nil {
-			return nil, &Error{Code: ErrCodeInterrupted, Op: "execute", Err: err}
+			return nil, nil, &Error{Code: ErrCodeInterrupted, Op: "execute", Err: err}
 		}
+
+		// 裁剪：先只读片段尾部 zone map（不加载列数据）。
+		// CFR1（无 zone）不裁剪；缺列/全 NULL 列由 pruneFragment 安全
+		// 处理，保证“被跳过的片段不可能有任何行满足全部谓词”。
+		if len(preds) > 0 {
+			zones, err := sn.store.loadZone(sn.table, meta)
+			if err != nil {
+				return nil, nil, err
+			}
+			if zones != nil && pruneFragment(zones, preds) {
+				stats.FragmentsSkipped++
+				continue
+			}
+		}
+
 		frag, err := sn.store.loadFragment(sn.table, meta)
 		if err != nil {
-			return nil, err // 已归一化：CORRUPT_FRAGMENT / INTERRUPTED
+			return nil, nil, err // 已归一化：CORRUPT_FRAGMENT / INTERRUPTED
 		}
+		stats.FragmentsScanned++
 
 		// 逐行评估谓词；命中行才计入内存配额与聚合状态。
 		n := frag.NumRows
 		for row := 0; row < n; row++ {
 			if row%1024 == 0 {
 				if err := ctx.Err(); err != nil {
-					return nil, &Error{Code: ErrCodeInterrupted, Op: "execute", Err: err}
+					return nil, nil, &Error{Code: ErrCodeInterrupted, Op: "execute", Err: err}
 				}
 			}
 			if !matchAll(frag, preds, row) {
 				continue
 			}
 			if err := lim.Acquire(perRowBytes); err != nil {
-				return nil, err
+				return nil, nil, err
 			}
+			stats.RowsMatched++
 			for _, st := range aggs {
 				st.add(frag, row)
 			}
@@ -163,7 +194,7 @@ func Execute(ctx context.Context, sn *Snapshot, q *Query, lim *MemLimiter) (*Res
 	for i, st := range aggs {
 		res.Values[i] = st.final()
 	}
-	return res, nil
+	return res, stats, nil
 }
 
 type boundPred struct {

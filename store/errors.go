@@ -20,6 +20,10 @@ const (
 	ErrCodeInterrupted ErrCode = "INTERRUPTED"
 	// ErrCodeNotFound 表或快照不存在。
 	ErrCodeNotFound ErrCode = "NOT_FOUND"
+	// ErrCodeVersionUnavailable 请求的历史版本已超出保留窗口。
+	ErrCodeVersionUnavailable ErrCode = "VERSION_UNAVAILABLE"
+	// ErrCodeCompactionBusy 已有整理在运行（手动重试即可）。
+	ErrCodeCompactionBusy ErrCode = "COMPACTION_BUSY"
 )
 
 // ConflictReason 写冲突的细分原因。
