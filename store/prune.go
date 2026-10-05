@@ -30,6 +30,11 @@ func rangeCanMatch(st ColumnStat, p boundPred) bool {
 	if p.op == OpNe {
 		return true
 	}
+	// 边界不可信（旧清单截断的 float 边界）：拿不准就不跳过，
+	// 照常扫描，保证裁剪永不改变查询结果。
+	if st.Untrusted {
+		return true
+	}
 	// 全 NULL 列不可能匹配任何比较。
 	if st.Min == nil || st.Max == nil {
 		return false
@@ -68,6 +73,9 @@ func describePruneDecision(meta FragmentMeta, preds []boundPred) string {
 		st, ok := meta.Stats[p.fieldID]
 		if !ok {
 			return fmt.Sprintf("片段 %s 缺列 id=%d => 跳过(NULL)", meta.Key, p.fieldID)
+		}
+		if st.Untrusted {
+			return fmt.Sprintf("片段 %s 列 id=%d 统计边界不可信 => 保守扫描", meta.Key, p.fieldID)
 		}
 		if !rangeCanMatch(st, p) {
 			return fmt.Sprintf("片段 %s 区段[%v..%v] 与谓词 id=%d op=%d v=%v 不相交 => 跳过",

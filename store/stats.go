@@ -10,6 +10,10 @@ type ColumnStat struct {
 	// Min/Max 为 nil 表示该列在片段中全部为 NULL（列存在但无取值）。
 	Min Value `json:"min,omitempty"`
 	Max Value `json:"max,omitempty"`
+	// Untrusted 为 true 表示落盘的边界无法精确还原（旧版清单被截断的
+	// float 边界），此时 Min/Max 为空且裁剪必须保守地视为恒可能命中，
+	// 绝不据此跳过片段。仅存在于解码后的内存态，不参与序列化。
+	Untrusted bool `json:"-"`
 }
 
 // computeColumnStats 按当前结构计算片段中各可见列的区段统计。
