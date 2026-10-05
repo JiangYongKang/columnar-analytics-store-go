@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"fmt"
+	"math"
 	"sync/atomic"
 )
 
@@ -248,6 +249,8 @@ func compare(v Value, op CmpOp, bound Value) bool {
 }
 
 // compareValues 同类型比较；数值类型 int64/float64 可互比。
+// int64 与 float64 的混合比较是精确的（不做 float64 舍入），
+// 保证大整数（>2^53）参与比较时行级过滤与区段裁剪判定一致。
 func compareValues(a, b Value) (int, bool) {
 	switch x := a.(type) {
 	case int64:
@@ -255,12 +258,12 @@ func compareValues(a, b Value) (int, bool) {
 		case int64:
 			return cmpOrdered(x, y), true
 		case float64:
-			return cmpOrdered(float64(x), y), true
+			return cmpInt64Float64(x, y), true
 		}
 	case float64:
 		switch y := b.(type) {
 		case int64:
-			return cmpOrdered(x, float64(y)), true
+			return -cmpInt64Float64(y, x), true
 		case float64:
 			return cmpOrdered(x, y), true
 		}
@@ -280,6 +283,39 @@ func compareValues(a, b Value) (int, bool) {
 		}
 	}
 	return 0, false
+}
+
+// cmpInt64Float64 精确比较 int64 与 float64，不经过 float64 舍入。
+// float64 只能精确表示 2^53 以内的整数，直接 float64(x) 会把
+// 9007199254740993 之类的值舍入成相邻偶数，导致比较结果错误。
+func cmpInt64Float64(x int64, y float64) int {
+	if math.IsNaN(y) {
+		return 0 // 与既有 cmpOrdered(NaN) 行为一致：视为相等
+	}
+	// 2^63 与 -2^63 都可精确表示；超出 int64 范围的 y 直接定胜负。
+	if y >= 9223372036854775808.0 { // 2^63
+		return -1
+	}
+	if y < -9223372036854775808.0 { // -2^63
+		return 1
+	}
+	yi := int64(y) // 向零截断；|y|<2^63 时安全
+	if x < yi {
+		return -1
+	}
+	if x > yi {
+		return 1
+	}
+	// x == yi：比较小数部分。|y|<2^52 时 float64(yi) 精确；
+	// |y|>=2^52 时 y 必为整数，frac 恰为 0。
+	frac := y - float64(yi)
+	if frac > 0 {
+		return -1
+	}
+	if frac < 0 {
+		return 1
+	}
+	return 0
 }
 
 func cmpOrdered[T ~int64 | ~float64 | ~string](a, b T) int {
